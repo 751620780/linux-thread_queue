@@ -9,15 +9,15 @@
 #include <pthread.h>
 using namespace std;
 
-//-----------------------------------------����Ϊ�����̺߳ͻָ��߳�ʹ�õľ�̬��----------------------------------------------------
+//-----------------------------------------以下为挂起线程和恢复线程使用的静态类----------------------------------------------------
 
-//��¼�߳���Ϣ�Ľṹ��
+//记录线程信息的结构体
 typedef  struct _THREADINFO
 {
-	pthread_t tid;//�̵߳�id
-	bool pending;//�ó�Ա���ڱ�ʶ����߳��Ƿ������ڹ�����
-	pthread_mutex_t mut;//���ڹ�������߳�ʹ�õĻ�����
-	pthread_cond_t cond;//���ڹ�������߳�ʹ�õ���������
+	pthread_t tid;//线程的id
+	bool pending;//该成员用于标识这个线程是否正处于挂起中
+	pthread_mutex_t mut;//用于挂起这个线程使用的互斥锁
+	pthread_cond_t cond;//用于挂起这个线程使用的条件变量
 }THREADINFO, *PTHREADINFO;
 
 struct ThreadEqual {
@@ -28,20 +28,20 @@ public:
 	}
 };
 
-//Ϊ�˿��ټ����̵߳���Ϣ�����ʹ��map������
+//为了快速检索线程的信息，因此使用map来保存
 typedef  unordered_map<pthread_t, PTHREADINFO, std::hash<pthread_t>, ThreadEqual> pthread_t_map;
 
 class Thread
 {
-public:
+private:
 	static pthread_t_map threads;
 	static void thread_addinfo(pthread_t tid);
 public:
-	//���߳̽���ʱ����������Ը��̵߳���Ϣ
+	//当线程结束时，清理本类对该线程的信息
 	static void thread_clearn();
-	//�ָ�ĳһ���̣߳������������
+	//恢复某一个线程，让其继续运行
 	static bool thread_resume(pthread_t tid);
-	//����ǰ�̣߳�ֱ�������ָ̻߳����߳�
+	//挂起当前线程，直到其他线程恢复本线程
 	static bool thread_pause();
 };
 
@@ -60,13 +60,13 @@ void Thread::thread_addinfo(pthread_t tid)
 	}
 }
 
-//Ӧ�����������һ��Ϣ������δ��ĳһʱ��ϵͳ�������̵߳�id�ڴ˼�¼�У��Ϳ�����������
+//应当定期清除这一信息，否则未来某一时刻系统创建了线程的id在此记录中，就可能引发错误
 void Thread::thread_clearn()
 {
 	auto tid = pthread_self();
 	if (Thread::threads.find(tid) != Thread::threads.end())
 	{
-		//���̵߳�ǰ�����ܴ��ڹ���״̬,�ɷ�������
+		//本线程当前不可能处于挂起状态,可放心销毁
 		auto pthreadinfo = Thread::threads[tid];
 		Thread::threads.erase(tid);
 		pthread_mutex_destroy(&pthreadinfo->mut);
@@ -75,13 +75,13 @@ void Thread::thread_clearn()
 	}
 }
 
-//�ָ�ĳһ���̣߳������������
+//恢复某一个线程，让其继续运行
 bool Thread::thread_resume(pthread_t tid)
 {
 
 	if (Thread::threads.find(tid) == Thread::threads.end())return false;
 	auto pthreadinfo = Thread::threads[tid];
-	//���̴߳��ڹ�����ʱ�����ǿ��������������е�ĳ����϶����̹߳���Ļ�������Ȼ���޸����Ƿ����еı�־��Ȼ��
+	//当线程处于挂起中时，我们可以在其挂起过程中的某个间隙获得线程挂起的互斥锁，然后修改其是否运行的标志，然后
 	pthread_mutex_lock(&pthreadinfo->mut);
 	pthreadinfo->pending = false;
 	pthread_cond_signal(&pthreadinfo->cond);
@@ -89,7 +89,7 @@ bool Thread::thread_resume(pthread_t tid)
 	return true;
 }
 
-//����ǰ�̣߳�ֱ�������ָ̻߳����̣߳����̲߳Ż�ָ����У�
+//挂起当前线程（直到其他线程恢复本线程，本线程才会恢复运行）
 bool Thread::thread_pause()
 {
 	auto tid = pthread_self();
@@ -100,85 +100,85 @@ bool Thread::thread_pause()
 	auto pthreadinfo = Thread::threads[tid];
 	pthread_mutex_lock(&pthreadinfo->mut);
 	pthreadinfo->pending = true;
-	while (pthreadinfo->pending)//ֻҪpendingΪtrue�����ó���һֱ�ȴ���ȥ(����ĵȴ����ǹ���)
+	while (pthreadinfo->pending)//只要pending为true，就让程序一直等待下去(这里的等待就是挂起)
 	{
-		//�������ִ�й�����������
-		//1.�ͷŻ����� 
-		//2.�̴߳��ڵȴ�״̬��ֱ��������������������߳�ʹ��pthread_cond_signal(&cond)�������������� 
-		//3.������������
-		//ע�⣺�߳�����ȴ��׶������߳̿��Ի�û��������޸�pending��ֵ��Ȼ�����ͷŻ�����
+		//这个函数执行共有三个步骤
+		//1.释放互斥锁 
+		//2.线程处于等待状态，直到条件变量被激活（其他线程使用pthread_cond_signal(&cond)激活条件变量） 
+		//3.锁定互斥锁。
+		//注意：线程在其等待阶段其他线程可以获得互斥锁并修改pending的值，然后再释放互斥锁
 		pthread_cond_wait(&pthreadinfo->cond, &pthreadinfo->mut);
 	}
 	pthread_mutex_unlock(&pthreadinfo->mut);
 	return true;
 }
 
-//----------------------------------------------------------------����Ϊ��Ϣ���е���-----------------------------------------
+//----------------------------------------------------------------以下为消息队列的类-----------------------------------------
 
-//������Ϣ�Ľṹ��
+//保存消息的结构体
 typedef struct _MSG
 {
-	int type;//��Ϣ������
-	int parameter_type;//�������ݵ���������
-	bool self_free;//ָʾdata��Ա��Ӧ�Ļ������Ƿ���Ҫ������Ϣ���߳��ͷ�
-	int  datalength;//data��Աָʾ�Ļ������ĳ���
-	void *data;//������Ϣ�Ļ�����
+	int type;//消息的类型
+	int parameter_type;//附加数据的数据类型
+	bool self_free;//指示data成员对应的缓冲区是否需要处理消息的线程释放
+	int  datalength;//data成员指示的缓冲区的长度
+	void *data;//保存消息的缓冲区
 }MSG, *PMSG;
 
-//��Ϣ���͵�ö��
+//消息类型的枚举
 enum msg_type
 {
-	a,/*�߳��˳�*/
-	b,/*��ӡ������*/
-	c,/*��ӡ�ַ���*/
-	d,/*���Է��ͽṹ��*/
+	a,/*线程退出*/
+	b,/*打印买泡面*/
+	c,/*打印字符串*/
+	d,/*测试发送结构体*/
 	e,
 	f,
 	g
 };
 
-typedef void *(*PFPROC) (void *);//�����߳�ʹ�õ��̺߳�������ָ����������
+typedef void *(*PFPROC) (void *);//创建线程使用的线程函数函数指针数据类型
 
 
-//�����̼߳以�෢����Ϣ���࣬����ά����Ϣ���в����̼߳��Ч�ķ�����Ϣ��
-//ʹ�����̣�
-//1.����һ������A
-//2.����A.start����
-//3.1��̬����һ��MSG����Ȼ���ʼ�������Ϣ����
-//3.2��һ���߳��е���A.add_msg��������Ϣ������������Ϣ�����Ϣ����
-//4.1��ThreadMsg����������߳��е���A.get_msg���������Ϣ(�����߳�Ҳ���Ե���������������Ϣ�����е���Ϣ)
-//4.2��ThreadMsg����������߳��д��������Ϣ
-//4.3��ThreadMsg����������߳����ͷŻ�ȡ������Ϣ���ڴ�
-//5.��ThreadMsg����������߳��˳�ʱ����A.thread_close����
+//用于线程间互相发送消息的类，该类维护消息队列并让线程间高效的发送消息。
+//使用流程：
+//1.创建一个对象A
+//2.调用A.start函数
+//3.1动态创建一个MSG对象，然后初始化这个消息对象
+//3.2在一个线程中调用A.add_msg函数向消息队列中添加消息这个消息对象
+//4.1在ThreadMsg对象关联的线程中调用A.get_msg函数获得消息(其它线程也可以调用这个函数获得消息队列中的消息)
+//4.2在ThreadMsg对象关联的线程中处理这个消息
+//4.3在ThreadMsg对象关联的线程中释放获取到的消息的内存
+//5.在ThreadMsg对象关联的线程退出时调用A.thread_close函数
 class ThreadMsg
 {
 private:
-	bool running;//ָʾ�����Ϣ�����Ƿ���Թ���
-	PFPROC proc;//���ڴ����߳�ʱ��ʱ�����̺߳�����ַ�ı���
-	pthread_t tid;//��Ϣ���й������̵߳�id
-	queue<PMSG> msgq;//��Ϣ����
-	pthread_mutex_t mutex_lock;//������Ϣ����ʹ�õĻ�����
-	vector<pthread_t> wait_threads;//��ǰΪ�˻�ȡ��Ϣ�����ڹ����е��̣߳���Щ�߳�һ����ѡ���˵ȴ���
+	bool running;//指示这个消息队列是否可以工作
+	PFPROC proc;//用于创建线程时临时保存线程函数地址的变量
+	pthread_t tid;//消息队列关联的线程的id
+	queue<PMSG> msgq;//消息队列
+	pthread_mutex_t mutex_lock;//访问消息队列使用的互斥锁
+	vector<pthread_t> wait_threads;//当前为了获取消息而处于挂起中的线程（这些线程一定是选择了等待）
 public:
 	ThreadMsg(pthread_t tid);
 	ThreadMsg(void *(*__start_routine) (void *));
 	~ThreadMsg();
-	//��ǰ����Ϣ����������һ����Ϣ
+	//向当前的消息队列中添加一个消息
 	bool add_msg(PMSG pmsg);
-	//����Ϣ������ȡ��һ����Ϣ
-	//wait����ΪTrue����������ʱһ������һ����Ϣ��ע�⺯����û����֮ǰ�����ñ��������߳̽�һֱ����������
-	//wait����ΪFalse���������������أ�����һ����Ϣ���ɹ��Ĵ���Ϣ������ȡ��һ����Ϣ���򷵻�NULL����ǰ��Ϣ������û����Ϣ��;
+	//从消息队列中取出一个消息
+	//wait参数为True：函数返回时一定返回一个消息。注意函数在没返回之前，调用本函数的线程将一直处于阻塞中
+	//wait参数为False：函数将立即返回，返回一个消息（成功的从消息队列中取出一个消息）或返回NULL（当前消息队列中没有消息）;
 	PMSG get_msg(bool wait);
-	//������Ϣ����
+	//启动消息队列
 	bool start();
-	//��ù����̵߳�tid
+	//获得关联线程的tid
 	pthread_t get_tid();
-	//�������߳̽���ʱ������õĺ���
+	//关联的线程结束时必须调用的函数
 	void thread_close();
 };
 
-//����һ����Ϣ�������ڽ����ڵĸ����߳�ͨ��
-//������pthread_t	�̵߳�id����ʾ�����Ϣ����Ĭ�Ϲ������̣߳�ʹ��ʱ���ÿ��ǹ����ԣ���Ϊ֧�������̴߳������Ϣ������ȡ����Ϣ��
+//创建一个消息队列用于进程内的各个线程通信
+//参数：pthread_t	线程的id（表示这个消息队列默认关联的线程，使用时不用考虑关联性，因为支持其他线程从这个消息队列中取出消息）
 ThreadMsg::ThreadMsg(pthread_t tid)
 {
 	this->tid = tid;
@@ -186,8 +186,8 @@ ThreadMsg::ThreadMsg(pthread_t tid)
 	running = false;
 }
 
-//����һ����Ϣ�������ڽ����ڵĸ����߳�ͨ�ţ������Ĭ�ϴ���һ���߳�
-//������thread_proc	�̵߳���ʼ������ַ����ʾ�����Ϣ����Ĭ�Ϲ������̣߳�
+//创建一个消息队列用于进程内的各个线程通信，这里会默认创建一个线程
+//参数：thread_proc	线程的起始函数地址（表示这个消息队列默认关联的线程）
 ThreadMsg::ThreadMsg(void *(*thread_proc) (void *))
 {
 	proc = thread_proc;
@@ -197,7 +197,7 @@ ThreadMsg::ThreadMsg(void *(*thread_proc) (void *))
 ThreadMsg::~ThreadMsg()
 {
 	running = false;
-	pthread_mutex_lock(&mutex_lock);//�ͷ���Ϣ������δ�������Ϣ
+	pthread_mutex_lock(&mutex_lock);//释放消息队列中未清除的消息
 	while (msgq.size())
 	{
 		auto pmsg = msgq.front();
@@ -207,13 +207,13 @@ ThreadMsg::~ThreadMsg()
 		free(pmsg);
 	}
 	pthread_mutex_unlock(&mutex_lock);
-	pthread_mutex_destroy(&mutex_lock);//�ͷ���Դ
+	pthread_mutex_destroy(&mutex_lock);//释放资源
 }
 
-//������Ϣ����
+//启动消息队列
 bool ThreadMsg::start()
 {
-	pthread_mutex_init(&mutex_lock, NULL);//��ʼ���߳���Ϣ����ʹ�õĻ�����
+	pthread_mutex_init(&mutex_lock, NULL);//初始化线程消息队列使用的互斥锁
 	if (proc == NULL && tid != 0)
 	{
 		running = true;
@@ -227,7 +227,7 @@ bool ThreadMsg::start()
 	return false;
 }
 
-//��ǰ����Ϣ����������һ����Ϣ
+//向当前的消息队列中添加一个消息
 bool ThreadMsg::add_msg(PMSG pmsg)
 {
 	if (!running) return false;
@@ -241,13 +241,13 @@ bool ThreadMsg::add_msg(PMSG pmsg)
 	pthread_mutex_unlock(&mutex_lock);
 }
 
-//����Ϣ������ȡ��һ����Ϣ
-//wait����Ϊtrue����������ʱһ������һ����Ϣ��ע�⺯����û����֮ǰ�����ñ��������߳̽�һֱ����������
-//wait����Ϊfalse���������������أ�����һ����Ϣ���ɹ��Ĵ���Ϣ������ȡ��һ����Ϣ���򷵻�NULL����ǰ��Ϣ������û����Ϣ��;
+//从消息队列中取出一个消息
+//wait参数为true：函数返回时一定返回一个消息。注意函数在没返回之前，调用本函数的线程将一直处于阻塞中
+//wait参数为false：函数将立即返回，返回一个消息（成功的从消息队列中取出一个消息）或返回NULL（当前消息队列中没有消息）;
 PMSG ThreadMsg::get_msg(bool wait)
 {
 	if (!running) return NULL;
-	//�Ȳ鿴�Ƿ�����Ϣ�������ֱ��ȡ����Ϣ������
+	//先查看是否有消息，如果有直接取出消息并返回
 	PMSG ret = NULL;
 A:
 	pthread_mutex_lock(&mutex_lock);
@@ -258,28 +258,28 @@ A:
 	}
 	pthread_mutex_unlock(&mutex_lock);
 	if (ret != NULL)return ret;
-	//��ǰ��Ϣ����������Ϣ
-	if (!wait)return ret;//�����Ը��ȴ�ֱ�ӷ���
-	//��ǰ��Ϣ�����ǿգ������߳�Ը��ȴ���ֱ����Ϣ������ܷ���
+	//当前消息队列中无消息
+	if (!wait)return ret;//如果不愿意等待直接返回
+	//当前消息队列是空，但是线程愿意等待，直到消息到达才能返回
 	auto tid = pthread_self();
-	wait_threads.push_back(tid);//����ǰ�߳����ӵ��ȴ���ǰ���е�������
-	Thread::thread_pause();//����ǰ�߳�,ֱ������̱߳��ָ�Ϊֹ
+	wait_threads.push_back(tid);//将当前线程添加到等待当前队列的向量中
+	Thread::thread_pause();//挂起当前线程,直到这个线程被恢复为止
 	goto A;
 }
 
-//��ù����̵߳�tid
+//获得关联线程的tid
 pthread_t ThreadMsg::get_tid()
 {
 	return tid;
 }
 
-//��Ϣ���й������߳��ڽ���ǰӦ�����õĺ�������������̵߳���Ϣ
+//消息队列关联的线程在结束前应当调用的函数，用于清除线程的信息
 void ThreadMsg::thread_close()
 {
 	Thread::thread_clearn();
 }
 
-//-----------------------------------------------------------����Ϊ���Դ���------------------------------------------------------------
+//-----------------------------------------------------------以下为测试代码------------------------------------------------------------
 
 typedef struct _test
 {
@@ -288,11 +288,11 @@ typedef struct _test
 	int length;
 	int age;
 	float high;
-	void* p;//ʵ������xxx����
+	void* p;//实际上是xxx类型
 }Test, *PTest;
 
-ThreadMsg* t1;//ȫ�ֱ����������̼߳乲��
-ThreadMsg *tmain;//ȫ�ֱ���
+ThreadMsg* t1;//全局变量，用于线程间共享
+ThreadMsg *tmain;//全局变量
 
 void *sub_thread_proc1(void *arg)
 {
@@ -305,37 +305,37 @@ void *sub_thread_proc1(void *arg)
 			switch (pMsg->type)
 			{
 			case a:
-				//��������������
+				//做你想做的事情
 				printf("Finish sub thread.\n");
 				printf("Get msg type:%d\n", a);
-				//�ͷ���Ϣ�ڲ��ṩ�Ļ�����
+				//释放消息内部提供的缓冲区
 				if (pMsg->self_free&&pMsg->data)free(pMsg->data);
-				//�ͷ�Msgռ�õ��ڴ�
+				//释放Msg占用的内存
 				free(pMsg);
 				printf("Sub thread is finished.\n");
 				t1->thread_close();
 				return NULL;
 				break;
-			case b://������
-				//��������������
+			case b://买泡面
+				//做你想做的事情
 				printf("Buy a package of instant noodles.\n");
 				printf("Get msg type:%d\n", b);
-				//�ͷ���Ϣ�ڲ��ṩ�Ļ�����
+				//释放消息内部提供的缓冲区
 				if (pMsg->self_free&&pMsg->data)free(pMsg->data);
-				//�ͷ�Msgռ�õ��ڴ�
+				//释放Msg占用的内存
 				free(pMsg);
 				break;
 			case c:
-				//��������������
+				//做你想做的事情
 				printf("%s\n", (char*)pMsg->data);
 				printf("Get msg type:%d\n", c);
-				//�ͷ���Ϣ�ڲ��ṩ�Ļ�����
+				//释放消息内部提供的缓冲区
 				if (pMsg->self_free&&pMsg->data)free(pMsg->data);
-				//�ͷ�Msgռ�õ��ڴ�
+				//释放Msg占用的内存
 				free(pMsg);
 				break;
 			case d:
-				//��������������
+				//做你想做的事情
 				PTest ptest = (PTest)pMsg->data;
 				cout << "age:" << ptest->age << endl;
 				cout << "humidity:" << ptest->humidity << endl;
@@ -347,9 +347,9 @@ void *sub_thread_proc1(void *arg)
 				cout << endl;
 				free(ptest->p);
 				printf("Get msg type:%d\n", d);
-				//�ͷ���Ϣ�ڲ��ṩ�Ļ�����
+				//释放消息内部提供的缓冲区
 				if (pMsg->self_free&&pMsg->data)free(pMsg->data);
-				//�ͷ�Msgռ�õ��ڴ�
+				//释放Msg占用的内存
 				free(pMsg);
 				break;
 			}
@@ -361,9 +361,9 @@ void *sub_thread_proc1(void *arg)
 void main_process_message(PMSG pMsg)
 {
 	if (!pMsg)return;
-	//�ͷ���Ϣ�ڲ��ṩ�Ļ�����
+	//释放消息内部提供的缓冲区
 	if (pMsg->self_free&&pMsg->data)free(pMsg->data);
-	//�ͷ�Msgռ�õ��ڴ�
+	//释放Msg占用的内存
 	free(pMsg);
 	return;
 }
@@ -386,8 +386,8 @@ int main()
 
 		//do work 3
 
-		//Ҳ���Ƿ�����Ϣ
-		//���߳�1����Ϣ����������һ����Ϣ
+		//也就是发送消息
+		//向线程1的消息队列中添加一条消息
 		auto pmsg = (PMSG)malloc(sizeof(MSG));
 		memset(pmsg, 0, sizeof(MSG));
 		pmsg->data = NULL;
@@ -396,7 +396,7 @@ int main()
 		pmsg->datalength = 0;
 		pmsg->parameter_type = 0;
 		t1->add_msg(pmsg);
-		//���߳�1����Ϣ����������һ����Ϣ
+		//向线程1的消息队列中添加一条消息
 		pmsg = (PMSG)malloc(sizeof(MSG));
 		memset(pmsg, 0, sizeof(MSG));
 		pmsg->data = malloc(50);
@@ -406,7 +406,7 @@ int main()
 		pmsg->datalength = 50;
 		pmsg->parameter_type = 0;
 		t1->add_msg(pmsg);
-		//���߳�1����Ϣ����������һ����Ϣ
+		//向线程1的消息队列中添加一条消息
 		pmsg = (PMSG)malloc(sizeof(MSG));
 		memset(pmsg, 0, sizeof(MSG));
 		PTest p = (PTest)malloc(sizeof(Test));
@@ -425,22 +425,22 @@ int main()
 		pmsg->parameter_type = 0;
 		t1->add_msg(pmsg);
 
-		//���߳�1����Ϣ����������һ����Ϣ
+		//向线程1的消息队列中添加一条消息
 		pmsg = (PMSG)malloc(sizeof(MSG));
 		memset(pmsg, 0, sizeof(MSG));
 		pmsg->type = a;
 		t1->add_msg(pmsg);
 
-		//�����̵߳���Ϣ������ȡ��Ϣ�����Դ���
+		//从主线程的消息队列中取消息，尝试处理
 		main_process_message(tmain->get_msg(false));
 		break;
 	}
 
 	printf("Main thread is runing.\n");
-	//���е����鶼�����ˣ���ȫ�Ľ���
-	pthread_join(t1->get_tid(), NULL);//�ȴ����߳��������˳�
+	//所有的事情都做完了，安全的结束
+	pthread_join(t1->get_tid(), NULL);//等待子线程正常的退出
 	tmain->thread_close();
-	//�ͷŶ�̬�����Ķ���
+	//释放动态创建的对象
 	delete t1;
 	t1 = NULL;
 	delete tmain;
